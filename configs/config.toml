@@ -1,0 +1,32 @@
+# Example stagbru config file — TOML equivalent of configs/config.yaml.
+# See that file for the full explanation of what this is for and how
+# STAGBRU_CONFIG loads it; this file just mirrors its content in TOML.
+
+HTTP_ADDR = ":9090"
+TS_LOGIN_SERVER = "https://headscale.example.invalid"
+TS_STATE_DIR = "/var/lib/tailscale"
+TS_HOSTNAME = "stagbru-gateway"
+TS_ROUTES = "172.16.6.0/24,100.192.8.0/24"
+
+[[wg.networks]]
+name = "default"
+interface = "wg0"
+listen_port = 51820
+self_secret = "gateway-self"
+self_name = "wg-node-name"
+peers_secret = "wg0-conf"
+masquerade = true
+advertise_to_tailscale = true
+
+# A second, independent network — uncomment and adjust once a real one
+# exists (see docs/plan.md's open question #10: no second network is
+# planned today, this is illustrative only).
+# [[wg.networks]]
+# name = "second-network"
+# interface = "wg1"
+# listen_port = 51821
+# self_secret = "second-gateway-self"
+# self_name = "second-wg-node-name"
+# peers_secret = "wg1-conf"
+# masquerade = true
+# advertise_to_tailscale = true

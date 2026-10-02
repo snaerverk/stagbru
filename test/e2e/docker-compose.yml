@@ -1,0 +1,52 @@
+# Phase 1 integration test stack (docs/plan.md). Two stagbru-like WireGuard
+# peers, driven entirely over HTTP by test/e2e/run.sh — see test/e2e/README.md.
+#
+# Keypairs below are throwaway, generated once for this test with
+# wgtypes.GeneratePrivateKey() (no security requirement — this network never
+# leaves the compose bridge). Do not reuse them for anything real.
+name: stagbru-e2e
+
+services:
+  peer-a:
+    build:
+      context: ../..
+      dockerfile: test/e2e/Dockerfile
+    cap_add:
+      - NET_ADMIN
+    devices:
+      - "/dev/net/tun:/dev/net/tun"
+    environment:
+      WG_INTERFACE: wg0
+      WG_LISTEN_PORT: "51820"
+      WG_ADDRESS: "10.99.0.1/24"
+      WG_PRIVATE_KEY: "IMukP8AR73Nctf+NCdJZgJBm5Pq3aJz1s/wLQOJEjlU="
+      HTTP_ADDR: ":8080"
+      # peer-b's identity, for run.sh to reference when building the
+      # POST /peers payload it sends to peer-a.
+      PEER_B_PUBLIC_KEY: "aecnfF7mIaRnImSJChoUWnidkQN5h2bPcKdjbjdLBVQ="
+    networks:
+      - e2e
+
+  peer-b:
+    build:
+      context: ../..
+      dockerfile: test/e2e/Dockerfile
+    cap_add:
+      - NET_ADMIN
+    devices:
+      - "/dev/net/tun:/dev/net/tun"
+    environment:
+      WG_INTERFACE: wg0
+      WG_LISTEN_PORT: "51820"
+      WG_ADDRESS: "10.99.0.2/24"
+      WG_PRIVATE_KEY: "CPoM5y/cJPS9mc52uim6Q9l3xKw4Au22hWJ5+Sgwo2A="
+      HTTP_ADDR: ":8080"
+      # peer-a's identity, for run.sh to reference when building the
+      # POST /peers payload it sends to peer-b.
+      PEER_A_PUBLIC_KEY: "5nugtxtT5TAp2VF5Gns5zpHQRT0hQuF/ygU5pNGdqEw="
+    networks:
+      - e2e
+
+networks:
+  e2e:
+    driver: bridge

@@ -1,0 +1,11 @@
+# Personal editor/tool settings, not shared project config.
+.claude/settings.local.json
+.vscode/
+
+# Go build artifacts.
+/bin/
+*.test
+*.out
+
+# OS cruft.
+.DS_Store

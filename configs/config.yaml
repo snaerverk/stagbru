@@ -1,0 +1,73 @@
+# Example stagbru config file.
+#
+# This is entirely optional: the in-cluster deployment today configures
+# stagbru purely through environment variables (see `stagbru --help`, or
+# docs/current-state.md for the real values) and does not need this file at
+# all. A config file is only needed for two things:
+#
+#   1. Local development / testing without a full Kubernetes Secret/env setup.
+#   2. Configuring more than one WireGuard network at once — koanf's plain
+#      environment-variable provider can't express a list of structs, but a
+#      YAML (or TOML — see configs/config.toml, an equivalent example) file
+#      can.
+#
+# Point stagbru at this file via the STAGBRU_CONFIG env var. It accepts a
+# comma-separated list of paths, loaded in order with later files
+# overriding earlier ones:
+#
+#   STAGBRU_CONFIG=configs/config.yaml stagbru
+#   STAGBRU_CONFIG=base.yaml,override.yaml stagbru
+#
+# Load order overall (later wins): compiled-in defaults -> file(s) listed in
+# STAGBRU_CONFIG, in order -> environment variables. So an env var always
+# wins over anything in this file — this file is a convenience layer, not a
+# replacement for the env-based configuration surface.
+
+# Flat scalar settings use the exact same bare names as their env-var
+# equivalents (see `stagbru --help` for the full list and their defaults).
+HTTP_ADDR: ":9090"
+TS_LOGIN_SERVER: "https://headscale.example.invalid"
+TS_STATE_DIR: "/var/lib/tailscale"
+TS_HOSTNAME: "stagbru-gateway"
+TS_ROUTES: "172.16.6.0/24,100.192.8.0/24"
+
+# wg.networks is the one thing that genuinely needs a file: a list of
+# WireGuard networks, each with its own interface/listen port/identity
+# Secret/peers Secret. Without this key (or with an empty list), stagbru
+# falls back to a single network named "default" built from the flat
+# WG_* env vars instead — see docs/plan.md's "Generalize internal/wg"
+# section and docs/current-state.md for what today's one real network's
+# values actually are.
+wg:
+  networks:
+    - name: default
+      interface: wg0
+      listen_port: 51820
+      # Secret name holding this network's own identity: keys PRIVATE_KEY
+      # and IP (envFrom also acceptable — see `stagbru --help`).
+      self_secret: gateway-self
+      # Excluded from this network's own peer list.
+      self_name: wg-node-name
+      # Secret name holding this network's desired peer list, key
+      # peers.json.
+      peers_secret: wg0-conf
+      # Install `oifname wg0 masquerade` for this network (see
+      # docs/plan.md's "Shared plumbing: one nftables table for both").
+      masquerade: true
+      # Union this network's live peer AllowedIPs into the tailnet's
+      # advertised routes.
+      advertise_to_tailscale: true
+
+    # A second, independent network — uncomment and adjust once a real one
+    # exists (see docs/plan.md's open question #10: no second network is
+    # planned today, this is illustrative only). name/interface/listen_port
+    # must all be unique across the whole list, and interface must be
+    # <= 15 bytes (Linux IFNAMSIZ - 1).
+    # - name: second-network
+    #   interface: wg1
+    #   listen_port: 51821
+    #   self_secret: second-gateway-self
+    #   self_name: second-wg-node-name
+    #   peers_secret: wg1-conf
+    #   masquerade: true
+    #   advertise_to_tailscale: true
