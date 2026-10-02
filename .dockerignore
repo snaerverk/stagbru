@@ -1,0 +1,6 @@
+.git
+docs/
+test/
+configs/
+.vscode/
+.claude/
