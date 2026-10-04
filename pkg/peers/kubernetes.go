@@ -5,7 +5,10 @@ import (
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/fields"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/watch"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/tools/cache"
 )
@@ -27,6 +30,14 @@ const defaultResync = 5 * time.Minute
 // get/list/watch with `resourceNames: [<Name>]` rather than namespace-wide
 // (docs/plan.md's "Manifest changes" section), and matches "one informer
 // per distinct peers_secret" from its "Generalize internal/wg" section.
+//
+// Built on the typed Secrets(namespace) List/Watch calls (rather than a raw
+// RESTClient ListWatch) specifically so it's exercisable against
+// k8s.io/client-go/kubernetes/fake in tests — a fake backend doesn't honor
+// the field selector (a known client-go fake limitation: only label
+// selectors are filtered, see kubernetes_test.go), but the selector is
+// still sent on every real request, which is what the RBAC grant above
+// actually depends on.
 type KubernetesSource struct {
 	Clientset kubernetes.Interface
 	Namespace string
@@ -43,8 +54,19 @@ func (s *KubernetesSource) Run(ctx context.Context, onUpdate func(data []byte)) 
 		resync = defaultResync
 	}
 
-	selector := fields.OneTermEqualSelector("metadata.name", s.Name)
-	lw := cache.NewListWatchFromClient(s.Clientset.CoreV1().RESTClient(), "secrets", s.Namespace, selector)
+	selector := fields.OneTermEqualSelector("metadata.name", s.Name).String()
+	secrets := s.Clientset.CoreV1().Secrets(s.Namespace)
+
+	lw := &cache.ListWatch{
+		ListFunc: func(opts metav1.ListOptions) (runtime.Object, error) {
+			opts.FieldSelector = selector
+			return secrets.List(ctx, opts)
+		},
+		WatchFunc: func(opts metav1.ListOptions) (watch.Interface, error) {
+			opts.FieldSelector = selector
+			return secrets.Watch(ctx, opts)
+		},
+	}
 
 	deliver := func(obj any) {
 		if secret, ok := obj.(*corev1.Secret); ok {
