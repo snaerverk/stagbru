@@ -38,11 +38,10 @@ var defaults = map[string]any{
 // Network describes one WireGuard network stagbru manages. Today's real
 // deployment has exactly one; the zero-config fallback (no config file, no
 // `networks` list) synthesizes a single Network named "default" from flat
-// env vars (WG_INTERFACE, WG_LISTEN_PORT, WG_SELF_SECRET, WG_PEERS_SECRET,
+// env vars (WG_INTERFACE, WG_LISTEN_PORT, WG_SELF_SECRET, WG_PEERS_SECRETS,
 // WG_SELF_NAME, WG_MASQUERADE, WG_ADVERTISE_TO_TAILSCALE).
 type Network struct {
-	// Name is this network's logical key: used as a metrics/log label and
-	// as the default prefix for PeersSecret when sharing is not explicit.
+	// Name is this network's logical key: used as a metrics/log label.
 	Name string `koanf:"name"`
 
 	// Interface is the kernel interface name. Must be unique across all
@@ -63,10 +62,14 @@ type Network struct {
 	// peers.json is expected to already exclude self upstream).
 	SelfName string `koanf:"self_name"`
 
-	// PeersSecret is the Kubernetes Secret name holding this network's
-	// desired peer list, key "peers.json". Two networks may share one
-	// PeersSecret.
-	PeersSecret string `koanf:"peers_secret"`
+	// PeersSources is this network's desired peer list, as one or more
+	// typed sources whose contents are unioned into one desired peer set
+	// (see pkg/peers). Two networks may list an identical source (e.g. the
+	// same Kubernetes Secret) — pkg/peers runs it once and shares the
+	// result. A public key appearing in more than one of a network's own
+	// sources is a validation error at reconcile time (pkg/peers), not
+	// silently resolved by precedence.
+	PeersSources []PeerSource `koanf:"peers_sources"`
 
 	// Masquerade installs `oifname Interface masquerade` in the shared
 	// nftables table for this network. See docs/plan.md's "Shared
@@ -77,6 +80,80 @@ type Network struct {
 	// the tailnet's advertised routes (see docs/plan.md's "Tailscale
 	// supervision" section).
 	AdvertiseToTailscale bool `koanf:"advertise_to_tailscale"`
+}
+
+// PeerSourceKubernetesSecret and PeerSourceOpenBao are the recognized
+// PeerSource.Type values.
+const (
+	// PeerSourceKubernetesSecret reads a Kubernetes Secret (key
+	// "peers.json") via an informer. Implemented in pkg/peers
+	// (KubernetesSource). Requires SecretName.
+	PeerSourceKubernetesSecret = "kubernetes_secret"
+
+	// PeerSourceOpenBao polls OpenBao's KV v2 API directly for the same
+	// peers.json-shaped payload, skipping the Kubernetes
+	// Secret/ExternalSecret hop. Accepted and validated here so manifests
+	// can adopt the shape ahead of time, but not yet runnable — see
+	// pkg/peers/doc.go for the planned implementation (OpenBao's
+	// kubernetes auth method, no static credential). Requires OpenBao.
+	PeerSourceOpenBao = "openbao"
+)
+
+// PeerSource is one source of peer data for a network. Which fields are
+// required depends on Type — see PeerSourceKubernetesSecret and
+// PeerSourceOpenBao.
+type PeerSource struct {
+	Type string `koanf:"type"`
+
+	// SecretName is required when Type == PeerSourceKubernetesSecret: the
+	// Kubernetes Secret name (in this pod's own namespace) holding the
+	// peer list, key "peers.json".
+	SecretName string `koanf:"secret_name"`
+
+	// OpenBao is required when Type == PeerSourceOpenBao.
+	OpenBao *OpenBaoPeerSource `koanf:"openbao"`
+}
+
+// OpenBaoPeerSource configures a PeerSourceOpenBao source: where to read
+// the peer list from OpenBao, and how to authenticate.
+type OpenBaoPeerSource struct {
+	// Address is the OpenBao server's API address, e.g.
+	// "https://openbao.internal:8200".
+	Address string `koanf:"address"`
+
+	// Mount is the KV v2 secrets engine mount point, e.g. "infra".
+	Mount string `koanf:"mount"`
+
+	// Path is the secret path under Mount holding this network's
+	// peers.json-shaped payload, e.g. "network/<mesh>/peers".
+	Path string `koanf:"path"`
+
+	// AuthRole is the OpenBao kubernetes auth method role stagbru
+	// authenticates as, exchanging this pod's projected ServiceAccount
+	// token for a short-lived OpenBao token.
+	AuthRole string `koanf:"auth_role"`
+
+	// AuthMountPath is the kubernetes auth method's mount path. Defaults
+	// to "kubernetes" if empty.
+	AuthMountPath string `koanf:"auth_mount_path"`
+}
+
+// ID returns a stable identity for this source: used to dedupe an
+// identical source referenced by more than one network (so pkg/peers runs
+// it once and shares the result, rather than watching/polling it twice)
+// and as its log label.
+func (p PeerSource) ID() string {
+	switch p.Type {
+	case PeerSourceKubernetesSecret:
+		return PeerSourceKubernetesSecret + ":" + p.SecretName
+	case PeerSourceOpenBao:
+		if p.OpenBao == nil {
+			return PeerSourceOpenBao + ":<unconfigured>"
+		}
+		return fmt.Sprintf("%s:%s/%s/%s", PeerSourceOpenBao, p.OpenBao.Address, p.OpenBao.Mount, p.OpenBao.Path)
+	default:
+		return "unknown:" + p.Type
+	}
 }
 
 // Tailscale holds the supervised tailscaled's configuration.
@@ -106,8 +183,9 @@ type Config struct {
 //
 // Validation performed here is limited to what's knowable from config
 // alone: every Network's Name/Interface/ListenPort is unique across the
-// list, every Interface is <= 15 bytes, and every Network has non-empty
-// SelfSecret/SelfName/PeersSecret. The cross-network "no two networks'
+// list, every Interface is <= 15 bytes, and every Network has a non-empty
+// SelfSecret/SelfName and at least one well-formed PeersSources entry. The
+// cross-network "no two networks'
 // peer AllowedIPs overlap" check from docs/plan.md happens later, once
 // peer data is actually available (it is NOT a config-time check — peers
 // come from a separate, dynamically-updated source, not this Config).
@@ -172,7 +250,7 @@ func Load(args []string) (*Config, error) {
 			ListenPort:           k.Int("WG_LISTEN_PORT"),
 			SelfSecret:           k.String("WG_SELF_SECRET"),
 			SelfName:             k.String("WG_SELF_NAME"),
-			PeersSecret:          k.String("WG_PEERS_SECRET"),
+			PeersSources:         peerSourcesFromEnv(k),
 			Masquerade:           k.Bool("WG_MASQUERADE"),
 			AdvertiseToTailscale: k.Bool("WG_ADVERTISE_TO_TAILSCALE"),
 		}}
@@ -201,6 +279,46 @@ func Load(args []string) (*Config, error) {
 	}
 
 	return cfg, nil
+}
+
+// peerSourcesFromEnv reads the default (zero-config) network's peer
+// sources. The flat env-var scheme only ever expresses
+// PeerSourceKubernetesSecret entries — anything else (e.g. PeerSourceOpenBao)
+// requires the wg.networks file layer, since it needs structured
+// per-source fields a flat scheme can't spell (same reasoning as
+// docs/plan.md's "Generalize internal/wg" section). WG_PEERS_SECRETS
+// (comma-separated) is preferred; WG_PEERS_SECRET (singular) is kept as a
+// fallback so today's real deployment (one secret, see
+// docs/current-state.md) needs no manifest change. Both set, or neither,
+// falls through to validate's "empty peers_sources" error.
+func peerSourcesFromEnv(k *koanf.Koanf) []PeerSource {
+	var names []string
+	if raw := k.String("WG_PEERS_SECRETS"); raw != "" {
+		names = splitCSV(raw)
+	} else if single := k.String("WG_PEERS_SECRET"); single != "" {
+		names = []string{single}
+	}
+	if len(names) == 0 {
+		return nil
+	}
+	sources := make([]PeerSource, len(names))
+	for i, name := range names {
+		sources[i] = PeerSource{Type: PeerSourceKubernetesSecret, SecretName: name}
+	}
+	return sources
+}
+
+// splitCSV splits a comma-separated string, trimming whitespace and
+// dropping empty fields.
+func splitCSV(s string) []string {
+	var out []string
+	for field := range strings.SplitSeq(s, ",") {
+		field = strings.TrimSpace(field)
+		if field != "" {
+			out = append(out, field)
+		}
+	}
+	return out
 }
 
 // configPaths returns the ordered list of config file paths to load, from
@@ -299,10 +417,47 @@ func validate(cfg *Config) error {
 		if n.SelfName == "" {
 			return fmt.Errorf("config: network %q: empty self_name", n.Name)
 		}
-		if n.PeersSecret == "" {
-			return fmt.Errorf("config: network %q: empty peers_secret", n.Name)
+		if len(n.PeersSources) == 0 {
+			return fmt.Errorf("config: network %q: empty peers_sources", n.Name)
+		}
+		seen := make(map[string]bool, len(n.PeersSources))
+		for i := range n.PeersSources {
+			if err := validatePeerSource(&n.PeersSources[i]); err != nil {
+				return fmt.Errorf("config: network %q: peers_sources[%d]: %w", n.Name, i, err)
+			}
+			id := n.PeersSources[i].ID()
+			if seen[id] {
+				return fmt.Errorf("config: network %q: duplicate peers_sources entry %q", n.Name, id)
+			}
+			seen[id] = true
 		}
 	}
 
+	return nil
+}
+
+// validatePeerSource checks one PeerSource against its Type's required
+// fields, and fills AuthMountPath's default in place.
+func validatePeerSource(p *PeerSource) error {
+	switch p.Type {
+	case PeerSourceKubernetesSecret:
+		if p.SecretName == "" {
+			return fmt.Errorf("type %q requires secret_name", p.Type)
+		}
+	case PeerSourceOpenBao:
+		if p.OpenBao == nil {
+			return fmt.Errorf("type %q requires an openbao block", p.Type)
+		}
+		if p.OpenBao.Address == "" || p.OpenBao.Mount == "" || p.OpenBao.Path == "" || p.OpenBao.AuthRole == "" {
+			return fmt.Errorf("type %q requires openbao.address, openbao.mount, openbao.path, and openbao.auth_role", p.Type)
+		}
+		if p.OpenBao.AuthMountPath == "" {
+			p.OpenBao.AuthMountPath = "kubernetes"
+		}
+	case "":
+		return fmt.Errorf("empty type (expected %q or %q)", PeerSourceKubernetesSecret, PeerSourceOpenBao)
+	default:
+		return fmt.Errorf("unknown type %q (expected %q or %q)", p.Type, PeerSourceKubernetesSecret, PeerSourceOpenBao)
+	}
 	return nil
 }
