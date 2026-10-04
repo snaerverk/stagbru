@@ -14,9 +14,17 @@ interface = "wg0"
 listen_port = 51820
 self_secret = "gateway-self"
 self_name = "wg-node-name"
-peers_secret = "wg0-conf"
 masquerade = true
 advertise_to_tailscale = true
+
+# One or more typed sources, unioned into one desired peer set (see
+# pkg/peers). "kubernetes_secret" (Secret in this pod's own namespace, key
+# peers.json, via an informer) is the only implemented type today; "openbao"
+# (poll OpenBao's KV v2 API directly, no Kubernetes Secret hop) is accepted
+# and validated but not yet runnable — see pkg/peers/doc.go.
+[[wg.networks.peers_sources]]
+type = "kubernetes_secret"
+secret_name = "wg0-conf"
 
 # A second, independent network — uncomment and adjust once a real one
 # exists (see docs/plan.md's open question #10: no second network is
@@ -27,6 +35,9 @@ advertise_to_tailscale = true
 # listen_port = 51821
 # self_secret = "second-gateway-self"
 # self_name = "second-wg-node-name"
-# peers_secret = "wg1-conf"
 # masquerade = true
 # advertise_to_tailscale = true
+#
+#   [[wg.networks.peers_sources]]
+#   type = "kubernetes_secret"
+#   secret_name = "wg1-conf"

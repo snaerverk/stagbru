@@ -15,12 +15,22 @@ import (
 	"os/signal"
 	"strings"
 	"syscall"
+	"time"
 
 	"golang.zx2c4.com/wireguard/wgctrl/wgtypes"
+	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/rest"
+	"k8s.io/client-go/tools/clientcmd"
 
 	"github.com/snaerverk/stagbru/pkg/config"
+	"github.com/snaerverk/stagbru/pkg/peers"
 	"github.com/snaerverk/stagbru/pkg/wg"
 )
+
+// peersResyncInterval is the periodic re-Reconcile safety net from
+// docs/plan.md's "Peer reconcile" section, independent of any source's own
+// resync (e.g. KubernetesSource's informer relist).
+const peersResyncInterval = 5 * time.Minute
 
 // version is overridden at build time via -ldflags "-X main.version=...";
 // see docs/plan.md's Phase 3 Dockerfile/CI section.
@@ -41,7 +51,7 @@ var envVars = []envVar{
 	{"WG_LISTEN_PORT", "51820", "UDP listen port for the default network"},
 	{"WG_SELF_SECRET", "(required)", "Secret name holding PRIVATE_KEY/IP (envFrom also acceptable; see below)"},
 	{"WG_SELF_NAME", "(required)", "this node's own name, excluded from its peer list"},
-	{"WG_PEERS_SECRET", "(required)", "Secret name holding the peer list, key peers.json"},
+	{"WG_PEERS_SECRETS", "(required)", "comma-separated Secret name(s) holding the peer list, key peers.json (legacy singular WG_PEERS_SECRET still accepted)"},
 	{"WG_MASQUERADE", "true", "install `oifname <interface> masquerade` for this network"},
 	{"WG_ADVERTISE_TO_TAILSCALE", "true", "union this network's peer AllowedIPs into the tailnet's advertised routes"},
 	{"PRIVATE_KEY", "(required)", "this node's WireGuard private key (base64) — set via WG_SELF_SECRET's envFrom"},
@@ -116,15 +126,32 @@ func run(logger *slog.Logger) error {
 	}
 
 	// TODO(pkg/nft): startup step 3, `table inet stagbru`, not built yet.
-	// TODO(pkg/peers): startup step 4, peer informer + first reconcile —
-	// interfaces above are up but have no peers configured yet.
+
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
+	defer stop()
+
+	// Startup order step 4: start the peer manager (one Source per
+	// distinct PeerSource across all networks; each network reconciles as
+	// soon as its own sources have all synced at least once — see
+	// pkg/peers.Manager's doc comment for why this is per-network rather
+	// than a single global "wait for everything" gate).
+	managerErrCh, err := startPeersManager(ctx, cfg, nodes, logger)
+	if err != nil {
+		return fmt.Errorf("start peers manager: %w", err)
+	}
+
 	// TODO(pkg/tailscale): startup steps 5-6, tailscaled supervision.
 	// TODO(pkg/health): /healthz, /readyz, /metrics; "mark the pod ready"
 	// (step 7) has nothing to report readiness through yet.
 
-	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
-	defer stop()
-	<-ctx.Done()
+	select {
+	case <-ctx.Done():
+	case err := <-managerErrCh:
+		if err != nil && !errors.Is(err, context.Canceled) {
+			logger.Error("peers manager exited unexpectedly", "error", err)
+		}
+		stop()
+	}
 	logger.Info("shutting down")
 
 	// Shutdown: best-effort close every network's interface even if one
@@ -150,6 +177,62 @@ func checkIPForward() error {
 		return errors.New("net.ipv4.ip_forward is not enabled (expected an initContainer to set it)")
 	}
 	return nil
+}
+
+// startPeersManager builds a pkg/peers.Manager for every configured
+// network (keyed to its already-brought-up *wg.Node) and starts it,
+// returning a channel that receives its terminal error (nil on a clean
+// ctx-canceled shutdown).
+func startPeersManager(ctx context.Context, cfg *config.Config, nodes map[string]*wg.Node, logger *slog.Logger) (<-chan error, error) {
+	if cfg.PodNamespace == "" {
+		return nil, errors.New("POD_NAMESPACE is required to watch peers sources (set via the downward API)")
+	}
+
+	clientset, err := newKubernetesClientset()
+	if err != nil {
+		return nil, fmt.Errorf("build kubernetes client: %w", err)
+	}
+
+	networkSpecs := make([]peers.NetworkSpec, 0, len(cfg.Networks))
+	for _, netCfg := range cfg.Networks {
+		networkSpecs = append(networkSpecs, peers.NetworkSpec{
+			Name:     netCfg.Name,
+			SelfName: netCfg.SelfName,
+			Sources:  netCfg.PeersSources,
+			Node:     nodes[netCfg.Name],
+		})
+	}
+
+	namespace := cfg.PodNamespace
+	manager := peers.NewManager(networkSpecs, func(src config.PeerSource) (peers.Source, error) {
+		return peers.NewSource(src, clientset, namespace)
+	}, logger)
+
+	errCh := make(chan error, 1)
+	go func() { errCh <- manager.Run(ctx) }()
+	go manager.ResyncEvery(ctx, peersResyncInterval)
+
+	return errCh, nil
+}
+
+// newKubernetesClientset builds a client-go clientset: in-cluster config
+// when run as a pod (the only real deployment target — see
+// docs/current-state.md), falling back to the ambient kubeconfig
+// (KUBECONFIG env var or ~/.kube/config) so `stagbru` can still be run by
+// hand against a real cluster for local development, matching how
+// pkg/config's optional file layer already exists purely for that purpose.
+func newKubernetesClientset() (kubernetes.Interface, error) {
+	restCfg, err := rest.InClusterConfig()
+	if err != nil {
+		restCfg, err = clientcmd.NewNonInteractiveDeferredLoadingClientConfig(
+			clientcmd.NewDefaultClientConfigLoadingRules(),
+			&clientcmd.ConfigOverrides{},
+		).ClientConfig()
+		if err != nil {
+			return nil, fmt.Errorf("no in-cluster config and no usable kubeconfig: %w", err)
+		}
+	}
+	return kubernetes.NewForConfig(restCfg)
 }
 
 // loadNodeConfig builds a wg.Config for one network.

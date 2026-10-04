@@ -48,9 +48,33 @@ wg:
       self_secret: gateway-self
       # Excluded from this network's own peer list.
       self_name: wg-node-name
-      # Secret name holding this network's desired peer list, key
-      # peers.json.
-      peers_secret: wg0-conf
+      # One or more typed sources for this network's desired peer list;
+      # their contents are unioned into one desired peer set (see
+      # pkg/peers). A public key appearing in more than one of a network's
+      # own sources is a hard error, not resolved by list order.
+      peers_sources:
+        # type: kubernetes_secret reads a Kubernetes Secret (in this pod's
+        # own namespace, key peers.json) via an informer — the only
+        # implemented type today.
+        - type: kubernetes_secret
+          secret_name: wg0-conf
+        # A second source for the same network — e.g. two Secrets unioned
+        # into one mesh. Uncomment to try it; two networks may also list an
+        # identical source, which pkg/peers then runs once and shares.
+        # - type: kubernetes_secret
+        #   secret_name: wg0-conf-extra
+        # type: openbao polls OpenBao's KV v2 API directly instead of going
+        # through an ExternalSecret-synced Kubernetes Secret, authenticating
+        # via OpenBao's kubernetes auth method. Accepted and validated by
+        # pkg/config already, but pkg/peers has no runnable implementation
+        # for it yet — see pkg/peers/doc.go.
+        # - type: openbao
+        #   openbao:
+        #     address: https://openbao.internal:8200
+        #     mount: infra
+        #     path: network/<mesh>/peers
+        #     auth_role: stagbru
+        #     auth_mount_path: kubernetes # defaults to this if omitted
       # Install `oifname wg0 masquerade` for this network (see
       # docs/plan.md's "Shared plumbing: one nftables table for both").
       masquerade: true
@@ -68,6 +92,8 @@ wg:
     #   listen_port: 51821
     #   self_secret: second-gateway-self
     #   self_name: second-wg-node-name
-    #   peers_secret: wg1-conf
+    #   peers_sources:
+    #     - type: kubernetes_secret
+    #       secret_name: wg1-conf
     #   masquerade: true
     #   advertise_to_tailscale: true

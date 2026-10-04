@@ -260,12 +260,14 @@ convenience):
 ```yaml
 wg:
   networks:
-    - name: default            # logical key: metrics label, log prefix, peers-secret default
+    - name: default            # logical key: metrics label, log prefix
       interface: wg0           # Linux IFNAMSIZ limit applies: max 15 chars, validated at startup
       listen_port: 51820
       self_secret: gateway-self   # Secret name; envFrom keys PRIVATE_KEY, IP (same shape as today)
       self_name: wg-node-name     # excluded from this network's own peer list
-      peers_secret: wg0-conf      # Secret name, key `peers.json`
+      peers_sources:               # one or more typed sources, unioned (see "Peer source" below)
+        - type: kubernetes_secret
+          secret_name: wg0-conf    # Secret name, key `peers.json`
       masquerade: true             # install `oifname <interface> masquerade`?
       advertise_to_tailscale: true # union this network's peer AllowedIPs into TS_ROUTES?
     # - name: second-network
@@ -277,26 +279,31 @@ wg:
 - **Backward compatible with zero config changes to the current cluster**:
   if `wg.networks` is empty/unset, `internal/config` synthesizes a single
   network named `default` from the existing flat env vars
-  (`WG_INTERFACE`, `WG_LISTEN_PORT`, `WG_SELF_SECRET`, `WG_PEERS_SECRET`,
-  `WG_SELF_NAME`) — this is exactly today's real deployment, see
-  current-state.md. The flat env vars are sugar for a one-network config,
-  not a second, parallel mechanism to keep in sync.
+  (`WG_INTERFACE`, `WG_LISTEN_PORT`, `WG_SELF_SECRET`, `WG_PEERS_SECRETS`
+  (or the legacy singular `WG_PEERS_SECRET`), `WG_SELF_NAME`) — this is
+  exactly today's real deployment, see current-state.md. The flat env vars
+  are sugar for a one-network, one-`kubernetes_secret`-source config, not a
+  second, parallel mechanism to keep in sync; a second source, or a
+  non-Kubernetes source type, requires the file layer.
 - **Validation at startup, across the whole list**: every `interface` is
   unique and ≤ 15 bytes; every `listen_port` is unique; every `name` is
-  unique (used as the metrics/log label and the default `peers_secret`
-  prefix); and no two networks' peer `allowed_ips` overlap (an exact overlap
-  between two different networks' peers is ambiguous to route and gets
-  rejected at validation, not silently resolved by "whichever reconciled
-  last wins").
+  unique (used as the metrics/log label); every network has at least one
+  well-formed `peers_sources` entry (required fields present for its
+  `type`, no duplicate source within one network's own list); and no two
+  networks' peer `allowed_ips` overlap (an exact overlap between two
+  different networks' peers is ambiguous to route and gets rejected at
+  validation, not silently resolved by "whichever reconciled last wins").
 - **`internal/wg` owns one `wgctrl` device + one reconcile loop per
-  network**, keyed by `name`. A failure in one network's informer or
+  network**, keyed by `name`. A failure in one network's sources or
   reconcile (e.g. its peers Secret is temporarily malformed) must not stop
   other networks from reconciling — isolate failures per network, not
   globally, and surface which network failed in both the log line and the
   `reconcile_total{result,network}` metric.
-- **`internal/peers` runs one informer per distinct `peers_secret`** (two
-  networks may share a `peers_secret` if their peers genuinely live in the
-  same Secret/namespace — don't assume 1:1 with networks).
+- **`internal/peers` runs one instance per distinct `peers_sources` entry**
+  (identity per `config.PeerSource.ID()`: for `kubernetes_secret`, its
+  Secret name) — two networks may list an identical entry if their peers
+  genuinely live in the same place, and it's then run once and shared;
+  don't assume 1:1 with networks.
 - **`internal/nft`'s `table inet stagbru` generalizes to the whole
   configured set**: `iifname`/`oifname` sets for the forward-accept rule
   become `{wg0, wg1, ..., tailscale0}` (every configured interface plus
@@ -331,6 +338,41 @@ wg:
   reports ready; on shutdown, best-effort delete all of them even if one
   fails, rather than stopping at the first error.
 
+### Peer source
+
+A network's `peers_sources` list is typed, not just a bag of Secret names,
+so a non-Kubernetes source can be added later without reshaping the config
+or the reconcile wiring:
+
+- **`kubernetes_secret`** — **Status: implemented.** Reads one Kubernetes
+  Secret, key `peers.json`, via its own informer scoped to exactly that
+  Secret's name (a `metadata.name` field selector) — this is what lets the
+  RBAC grant be `resourceNames: [<name>]` rather than namespace-wide. Its
+  informer's relist interval (five minutes) doubles as the "own periodic
+  resync" safety net below.
+- **`openbao`** — **Status: not implemented.** Accepted and validated by
+  `internal/config` (required fields present, `auth_mount_path` defaulted)
+  so configs/manifests can adopt the shape ahead of time, but
+  `internal/peers.NewSource` returns an error if one is actually configured
+  — there is no code behind it yet. When built, it would poll OpenBao's KV
+  v2 API directly for the same peers.json-shaped payload, skipping the
+  ExternalSecret-synced Kubernetes Secret entirely — `address`/`mount`/`path`
+  locate it, same as `current-state.md`'s Vault publishing path but read
+  straight from OpenBao instead of via ExternalSecrets. Authentication
+  would be OpenBao's kubernetes auth method: stagbru exchanges this pod's
+  projected ServiceAccount token (`auth_role`, `auth_mount_path`, default
+  `kubernetes`) for a short-lived OpenBao token — no static credential to
+  provision, matching how the cluster already trusts pod identity for
+  everything else here. `internal/peers`'s `Source` interface is exactly
+  the seam this would slot in behind: "watch one `peers_sources` entry,
+  report its raw bytes when they change" — nothing about `Manager`, peer
+  parsing/validation, or `Node.Reconcile` would need to change for it to
+  exist.
+
+A single network may list sources of different types side by side (e.g.
+one `kubernetes_secret` and one `openbao` entry, unioned) — `Manager`
+builds each entry's `Source` independently by its own `type`.
+
 This is a real capability addition, not just future-proofing for its own
 sake: it lets `stagbru` eventually gateway a second site-to-site mesh (or a
 second mesh with a different trust boundary, e.g. a partner network that
@@ -344,7 +386,7 @@ the real infra today, see the open-questions entry on this below.
 ```
 cmd/stagbru/main.go           flags/env/config wiring, signal handling
 internal/config/              koanf setup, validation
-internal/peers/                Secret informer → []Peer (JSON decode, validation)
+internal/peers/                typed peer sources (Secret informer today) → []Peer (JSON decode, validation)
 internal/wg/                   N networks: link/address mgmt, peer diff+apply, route sync
 internal/nft/                  build + atomically replace `table inet stagbru` for all networks
 internal/tailscale/            tailscaled supervisor + LocalAPI prefs
@@ -383,7 +425,7 @@ there's no clean flat-env-var spelling for a list of structs.
 | `WG_INTERFACE` | `wg0` | interface name (default network) |
 | `WG_LISTEN_PORT` | `51820` | (default network) |
 | `WG_SELF_SECRET` | `<GATEWAY_POD>-self` | private key + `IP` env keys (envFrom also acceptable) |
-| `WG_PEERS_SECRET` | `wg0-conf` | ExternalSecret output, key `peers.json` |
+| `WG_PEERS_SECRETS` | `wg0-conf` | comma-separated, one `kubernetes_secret` source per entry (legacy singular `WG_PEERS_SECRET` still accepted); ExternalSecret output, key `peers.json` |
 | `WG_SELF_NAME` | `<WG_NODE_NAME>` | excluded from peers defensively |
 | `WG_MASQUERADE` | `true` | install `oifname wg0 masquerade`? (default network) |
 | `WG_ADVERTISE_TO_TAILSCALE` | `true` | union this network's peer AllowedIPs into the tailnet's advertised routes? |
@@ -427,10 +469,11 @@ and let Kubernetes restart the pod.
    - one postrouting `oifname <interface> masquerade` line per network with
      `masquerade: true` (replaces today's `iptables ... MASQUERADE` — see
      current-state.md for exactly why the one network today needs it).
-4. Start one peer informer per distinct `peers_secret` across all networks.
-   Wait for every network's first sync, then do each network's first full
-   reconcile (a failure in one network's informer/reconcile must not block
-   another's — see above).
+4. Start one `Source` per distinct `peers_sources` entry across all
+   networks (see "Peer source" above). Each network does its own first full
+   reconcile as soon as its own sources have all synced at least once (a
+   failure in one network's sources/reconcile must not block another's —
+   see above).
 5. Start `tailscaled` as a child process: `--tun=tailscale0
    --state=$TS_STATE_DIR/tailscaled.state`, socket in an emptyDir, stdout and
    stderr forwarded to stagbru's log with a prefix.

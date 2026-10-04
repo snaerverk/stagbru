@@ -5,6 +5,7 @@ import (
 	"net/netip"
 	"os"
 	"path/filepath"
+	"reflect"
 	"testing"
 )
 
@@ -27,6 +28,7 @@ func withEnv(t *testing.T, overrides map[string]string) {
 
 	managed := []string{
 		"WG_INTERFACE", "WG_LISTEN_PORT", "WG_SELF_SECRET", "WG_PEERS_SECRET",
+		"WG_PEERS_SECRETS",
 		"WG_SELF_NAME", "WG_MASQUERADE", "WG_ADVERTISE_TO_TAILSCALE",
 		"POD_NAMESPACE", "TS_LOGIN_SERVER", "TS_AUTHKEY", "TS_STATE_DIR",
 		"TS_HOSTNAME", "TS_ROUTES", "HTTP_ADDR", "STAGBRU_CONFIG",
@@ -69,11 +71,11 @@ func TestLoad_FlatEnvFallback_Defaults(t *testing.T) {
 		ListenPort:           51820,
 		SelfSecret:           "gateway-self",
 		SelfName:             "wg-node-name",
-		PeersSecret:          "wg0-conf",
+		PeersSources:         []PeerSource{{Type: PeerSourceKubernetesSecret, SecretName: "wg0-conf"}},
 		Masquerade:           true,
 		AdvertiseToTailscale: true,
 	}
-	if n != want {
+	if !reflect.DeepEqual(n, want) {
 		t.Errorf("Networks[0] = %+v, want %+v", n, want)
 	}
 
@@ -200,12 +202,12 @@ func TestLoad_TSRoutes_Empty(t *testing.T) {
 func TestValidate_NetworkList(t *testing.T) {
 	validNetwork := func(name, iface string, port int) Network {
 		return Network{
-			Name:        name,
-			Interface:   iface,
-			ListenPort:  port,
-			SelfSecret:  "self",
-			SelfName:    "self-name",
-			PeersSecret: "peers",
+			Name:         name,
+			Interface:    iface,
+			ListenPort:   port,
+			SelfSecret:   "self",
+			SelfName:     "self-name",
+			PeersSources: []PeerSource{{Type: PeerSourceKubernetesSecret, SecretName: "peers"}},
 		}
 	}
 
@@ -246,6 +248,56 @@ func TestValidate_NetworkList(t *testing.T) {
 			},
 			wantErr: true,
 		},
+		{
+			name: "unknown peer source type",
+			networks: func() []Network {
+				n := validNetwork("default", "wg0", 51820)
+				n.PeersSources = []PeerSource{{Type: "s3"}}
+				return []Network{n}
+			}(),
+			wantErr: true,
+		},
+		{
+			name: "kubernetes_secret missing secret_name",
+			networks: func() []Network {
+				n := validNetwork("default", "wg0", 51820)
+				n.PeersSources = []PeerSource{{Type: PeerSourceKubernetesSecret}}
+				return []Network{n}
+			}(),
+			wantErr: true,
+		},
+		{
+			name: "openbao missing fields",
+			networks: func() []Network {
+				n := validNetwork("default", "wg0", 51820)
+				n.PeersSources = []PeerSource{{Type: PeerSourceOpenBao, OpenBao: &OpenBaoPeerSource{Address: "https://openbao.internal:8200"}}}
+				return []Network{n}
+			}(),
+			wantErr: true,
+		},
+		{
+			name: "openbao fully configured is valid",
+			networks: func() []Network {
+				n := validNetwork("default", "wg0", 51820)
+				n.PeersSources = []PeerSource{{Type: PeerSourceOpenBao, OpenBao: &OpenBaoPeerSource{
+					Address: "https://openbao.internal:8200", Mount: "infra", Path: "network/default/peers", AuthRole: "stagbru",
+				}}}
+				return []Network{n}
+			}(),
+			wantErr: false,
+		},
+		{
+			name: "duplicate peer source within one network",
+			networks: func() []Network {
+				n := validNetwork("default", "wg0", 51820)
+				n.PeersSources = []PeerSource{
+					{Type: PeerSourceKubernetesSecret, SecretName: "peers"},
+					{Type: PeerSourceKubernetesSecret, SecretName: "peers"},
+				}
+				return []Network{n}
+			}(),
+			wantErr: true,
+		},
 	}
 
 	for _, tt := range tests {
@@ -276,7 +328,11 @@ wg:
       listen_port: 51820
       self_secret: gateway-self
       self_name: wg-node-name
-      peers_secret: wg0-conf
+      peers_sources:
+        - type: kubernetes_secret
+          secret_name: wg0-conf
+        - type: kubernetes_secret
+          secret_name: wg0-conf-extra
       masquerade: true
       advertise_to_tailscale: true
     - name: second
@@ -284,7 +340,13 @@ wg:
       listen_port: 51821
       self_secret: second-gateway-self
       self_name: second-wg-node-name
-      peers_secret: wg1-conf
+      peers_sources:
+        - type: openbao
+          openbao:
+            address: https://openbao.internal:8200
+            mount: infra
+            path: network/second/peers
+            auth_role: stagbru
       masquerade: false
       advertise_to_tailscale: false
 `
@@ -307,6 +369,27 @@ func TestLoad_ConfigFile_YAML_Networks(t *testing.T) {
 	if cfg.Networks[1].Interface != "wg1" || cfg.Networks[1].ListenPort != 51821 {
 		t.Errorf("Networks[1] = %+v", cfg.Networks[1])
 	}
+	wantSources := []PeerSource{
+		{Type: PeerSourceKubernetesSecret, SecretName: "wg0-conf"},
+		{Type: PeerSourceKubernetesSecret, SecretName: "wg0-conf-extra"},
+	}
+	if !reflect.DeepEqual(cfg.Networks[0].PeersSources, wantSources) {
+		t.Errorf("Networks[0].PeersSources = %+v, want %+v", cfg.Networks[0].PeersSources, wantSources)
+	}
+
+	wantOpenBao := []PeerSource{{
+		Type: PeerSourceOpenBao,
+		OpenBao: &OpenBaoPeerSource{
+			Address:       "https://openbao.internal:8200",
+			Mount:         "infra",
+			Path:          "network/second/peers",
+			AuthRole:      "stagbru",
+			AuthMountPath: "kubernetes", // defaulted by validate()
+		},
+	}}
+	if !reflect.DeepEqual(cfg.Networks[1].PeersSources, wantOpenBao) {
+		t.Errorf("Networks[1].PeersSources = %+v, want %+v", cfg.Networks[1].PeersSources, wantOpenBao)
+	}
 }
 
 const twoNetworksTOML = `
@@ -316,9 +399,12 @@ interface = "wg0"
 listen_port = 51820
 self_secret = "gateway-self"
 self_name = "wg-node-name"
-peers_secret = "wg0-conf"
 masquerade = true
 advertise_to_tailscale = true
+
+  [[wg.networks.peers_sources]]
+  type = "kubernetes_secret"
+  secret_name = "wg0-conf"
 
 [[wg.networks]]
 name = "second"
@@ -326,9 +412,12 @@ interface = "wg1"
 listen_port = 51821
 self_secret = "second-gateway-self"
 self_name = "second-wg-node-name"
-peers_secret = "wg1-conf"
 masquerade = false
 advertise_to_tailscale = false
+
+  [[wg.networks.peers_sources]]
+  type = "kubernetes_secret"
+  secret_name = "wg1-conf"
 `
 
 func TestLoad_ConfigFile_TOML_Networks(t *testing.T) {
@@ -361,13 +450,17 @@ wg:
       listen_port: 51820
       self_secret: gateway-self
       self_name: wg-node-name
-      peers_secret: wg0-conf
+      peers_sources:
+        - type: kubernetes_secret
+          secret_name: wg0-conf
     - name: second
       interface: wg0
       listen_port: 51821
       self_secret: second-gateway-self
       self_name: second-wg-node-name
-      peers_secret: wg1-conf
+      peers_sources:
+        - type: kubernetes_secret
+          secret_name: wg1-conf
 `)
 	os.Setenv("STAGBRU_CONFIG", path)
 
