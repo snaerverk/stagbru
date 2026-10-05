@@ -1,7 +1,8 @@
 // Command stagbru runs one or more WireGuard nodes inside a Kubernetes
 // pod. See docs/plan.md for the full design; this file currently wires up
-// only what's built so far (pkg/config, pkg/wg) — see the TODOs below for
-// what's still missing before this matches the full spec.
+// only what's built so far (pkg/config, pkg/wg, pkg/nft, pkg/peers) — see
+// the TODOs below for what's still missing before this matches the full
+// spec.
 package main
 
 import (
@@ -68,7 +69,7 @@ var envVars = []envVar{
 
 func usage() {
 	w := flag.CommandLine.Output()
-	fmt.Fprintf(w, "stagbru runs one or more WireGuard nodes inside a Kubernetes pod\nand (eventually) bridges them onto a tailnet. See docs/plan.md for the\nfull design — this build only implements interface bring-up so far.\n\n")
+	fmt.Fprintf(w, "stagbru runs one or more WireGuard nodes inside a Kubernetes pod\nand (eventually) bridges them onto a tailnet. See docs/plan.md for the\nfull design — Tailscale supervision and probes/metrics aren't built yet.\n\n")
 	fmt.Fprintf(w, "Usage:\n  stagbru [flags]\n\n")
 	fmt.Fprintf(w, "Flags:\n")
 	flag.PrintDefaults()
@@ -125,7 +126,14 @@ func run(logger *slog.Logger) error {
 		logger.Info("wireguard interface up", "network", netCfg.Name, "interface", netCfg.Interface, "listen_port", netCfg.ListenPort)
 	}
 
-	// TODO(pkg/nft): startup step 3, `table inet stagbru`, not built yet.
+	// Startup order step 3: install `table inet stagbru` (forward-accept
+	// plus per-network masquerade). A pure function of cfg.Networks, so
+	// this runs once at startup, not on every peer reconcile.
+	removeNFTables, err := installNFTables(cfg.Networks)
+	if err != nil {
+		return fmt.Errorf("install nftables table: %w", err)
+	}
+	logger.Info("nftables table installed")
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
 	defer stop()
@@ -154,10 +162,15 @@ func run(logger *slog.Logger) error {
 	}
 	logger.Info("shutting down")
 
-	// Shutdown: best-effort close every network's interface even if one
-	// fails (docs/plan.md's "Shutdown" section — steps 1-3 are TODOs
-	// above; this is step 4).
+	// Shutdown (docs/plan.md's "Shutdown" section — steps 1-2, marking the
+	// pod not ready and stopping tailscaled, have nothing to do yet):
 	var errs []error
+	// Step 3: delete `table inet stagbru`.
+	if err := removeNFTables(); err != nil {
+		errs = append(errs, fmt.Errorf("remove nftables table: %w", err))
+	}
+	// Step 4: best-effort close every network's interface even if one
+	// fails.
 	for name, node := range nodes {
 		if err := node.Close(); err != nil {
 			errs = append(errs, fmt.Errorf("network %q: %w", name, err))

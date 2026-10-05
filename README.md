@@ -13,5 +13,9 @@ headscale subnet router), plus the nftables rules connecting them.
   (emails, public IP, internal hostnames) are redacted since this repo is
   public — see the note at the top of that file.
 
-No code beyond a placeholder `cmd/main.go` exists yet — see `docs/plan.md`
-Phase 1 for what's next.
+Built so far: WireGuard node bring-up and peer reconcile (`pkg/wg`),
+configuration (`pkg/config`), peer sources — Kubernetes Secret watch-and-reload
+today, with an OpenBao-backed source designed but not yet implemented
+(`pkg/peers`), and the shared `table inet stagbru` nftables rules (`pkg/nft`).
+Not yet built: Tailscale supervision, probes/metrics, and the manifests —
+see `docs/plan.md` for the full plan and what's still open.
